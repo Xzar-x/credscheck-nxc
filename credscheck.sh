@@ -10,6 +10,9 @@
 set -u
 set -o pipefail
 
+# Ensure standard system and user binary paths are in PATH
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin:$HOME/.local/bin"
+
 # ANSI colors — automatically disabled when stdout is not a terminal
 if [[ -t 1 ]]; then
 	C_RESET='\033[0m'
@@ -288,11 +291,10 @@ done
 protocols=("${active_protocols[@]}")
 
 # Protocols where anonymous/guest/empty make no protocol-level sense
-# (SSH/WinRM/RDP require a real account - there is no concept of an "anonymous
-# login" for them). In blind mode they only get a single availability probe
-# instead of the full list of 5 attempts, which have no real chance of
-# succeeding except by pure coincidence of a misconfiguration.
-declare -A blind_minimal=([ssh]=1 [winrm]=1 [rdp]=1)
+# (SSH/WinRM/RDP require a real account; NFS uses export ACLs and RPC UID/GID rather
+# than password authentication). In blind mode they only get a single availability
+# probe instead of the full list of 5 attempts.
+declare -A blind_minimal=([ssh]=1 [winrm]=1 [rdp]=1 [nfs]=1)
 
 # Additional, commonly known default vendor/installer credentials - deliberately
 # ONLY for mssql (SQL Server auth rarely has a lockout policy). I'm intentionally
@@ -304,7 +306,7 @@ declare -A extra_defaults=([mssql]="sa:sa sa: sa:Password123 sa:admin")
 if ((user_set)); then
 	mode="Test of supplied credentials"
 else
-	mode="Test anonymous/guest/empty (SSH/WinRM/RDP: availability probe only)"
+	mode="Test anonymous/guest/empty (SSH/WinRM/RDP/NFS: availability probe only)"
 fi
 
 get_creds_for_proto() {
@@ -481,6 +483,28 @@ for proto in "${protocols[@]}"; do
 			status="REJECTED"
 		fi
 
+		# NFS special handling: NetExec NFS doesn't authenticate user/pass, so check exports via showmount
+		if [[ "$proto" == "nfs" && "$status" == "UNKNOWN" && $rc -eq 0 ]]; then
+			if command -v showmount >/dev/null 2>&1; then
+				_sm_check=$(timeout 5s showmount -e "$target" 2>&1)
+				if (( $? == 0 )); then
+					_sm_first=$(awk '$1 ~ /^\// {print $1}' <<<"$_sm_check" | head -1)
+					_sm_count=$(awk '$1 ~ /^\// {print $1}' <<<"$_sm_check" | wc -l)
+					if [[ -n "$_sm_first" ]]; then
+						status="SUCCESS"
+						if ((_sm_count > 1)); then
+							info_field="exports: $_sm_first (+$((_sm_count - 1)))"
+						else
+							info_field="export: $_sm_first"
+						fi
+					else
+						status="REJECTED"
+						info_field="no exports found"
+					fi
+				fi
+			fi
+		fi
+
 		# Print final one-line result (overwriting the "..." line on a terminal)
 		_elapsed_s="${elapsed}s"
 		_line_plain="$(printf '%s %-7s %-22s %-20s %4s' "$attempt_tag" "$proto" "$creds_display" "$status" "$_elapsed_s")"
@@ -521,6 +545,14 @@ for proto in "${protocols[@]}"; do
 		raw_passes+=("$p")
 		raw_statuses+=("$status")
 
+		if ((user_set == 0)) && [[ "$status" == "SUCCESS" ]]; then
+			if ((idx + 1 < ${#proto_users[@]})); then
+				skipped_for_proto=$(( ${#proto_users[@]} - idx - 1 ))
+				_ok "Confirmed success for $proto — skipping $skipped_for_proto remaining blind check(s)."
+			fi
+			break
+		fi
+
 		if ((attempt < run_count)); then
 			delay=$(awk -v r="$RANDOM" -v min="$delay_min" -v max="$delay_max" 'BEGIN{srand(r); printf "%.2f", min+rand()*(max-min)}')
 			sleep "$delay"
@@ -528,7 +560,9 @@ for proto in "${protocols[@]}"; do
 	done
 	((attempt >= run_count)) && break
 done
-if ((planned > run_count)); then log "${C_DIM}Stopped after $run_count calls; skipped $((planned - run_count)) combinations.${C_RESET}"; fi
+if ((planned > attempt)); then
+	log "${C_DIM}Finished in $attempt call(s); skipped $((planned - attempt)) combinations (success detected or limit).${C_RESET}"
+fi
 
 # -- SUMMARY ------------------------------------------------------------------
 log ""
@@ -548,7 +582,7 @@ log "${C_BOLD}${C_WHITE}${_hdr}${C_RESET}"
 _sep_len=${#_hdr}
 log "${C_DIM}$(printf '%0.s-' $(seq 1 "$_sep_len"))${C_RESET}"
 
-confirmed=0 uncertain=0
+confirmed=0 uncertain=0 rejected_count=0
 for row in "${rows[@]}"; do
 	IFS="$FS" read -r _proto _creds _status _elapsed _info <<<"$row"
 	_line="$(printf "  %-${_w_proto}s  %-${_w_creds}s  %-${_w_status}s  %4s  %s" "$_proto" "$_creds" "$_status" "$_elapsed" "$_info")"
@@ -558,8 +592,12 @@ for row in "${rows[@]}"; do
 	elif [[ "$_status" == "POSSIBLE SUCCESS" ]]; then
 		log "${C_YELLOW}${C_BOLD}${_line}${C_RESET}"
 		uncertain=$((uncertain + 1))
+	elif [[ "$_status" == "UNKNOWN" ]]; then
+		log "$_line"
+		uncertain=$((uncertain + 1))
 	elif [[ "$_status" == "REJECTED" ]]; then
 		log "${C_RED}${_line}${C_RESET}"
+		rejected_count=$((rejected_count + 1))
 	elif [[ "$_status" == "TIMEOUT" ]] || [[ "$_status" == "CONNECTION FAILED" ]] || [[ "$_status" == "NXC ERROR" ]]; then
 		log "${C_YELLOW}${_line}${C_RESET}"
 	else
@@ -580,19 +618,27 @@ if ((uncertain > 0)); then
 else
 	log "${C_DIM}  ⚠  to verify: $uncertain / $_total${C_RESET}"
 fi
-log "${C_DIM}  ✗  rejected:  $((  _total - confirmed - uncertain  )) / $_total${C_RESET}"
+if ((rejected_count > 0)); then
+	log "${C_RED}  ✗  rejected:  $rejected_count / $_total${C_RESET}"
+else
+	log "${C_DIM}  ✗  rejected:  $rejected_count / $_total${C_RESET}"
+fi
 log ""
 log "${C_DIM}[info]  The meaning of \"[+]\" differs between protocols; verify results manually.${C_RESET}"
 
 declare -a valid_indices=()
+declare -a non_rejected_indices=()
 for i in "${!raw_statuses[@]}"; do
 	st="${raw_statuses[$i]}"
 	if [[ "$st" == "SUCCESS" ]] || [[ "$st" == "POSSIBLE SUCCESS" ]]; then
 		valid_indices+=("$i")
 	fi
+	if [[ "$st" != "REJECTED" && "$st" != "CONNECTION FAILED" && "$st" != "TIMEOUT" ]]; then
+		non_rejected_indices+=("$i")
+	fi
 done
 
-if (( ${#raw_statuses[@]} > 0 && no_launch == 0 )); then
+if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 	launch_choice="n"
 	if ((${#valid_indices[@]} > 0)); then
 		echo ""
@@ -605,11 +651,11 @@ if (( ${#raw_statuses[@]} > 0 && no_launch == 0 )); then
 	fi
 
 	if [[ "$launch_choice" =~ ^[Yy] ]]; then
-		declare -a current_choices=("${valid_indices[@]}")
-		if ((${#current_choices[@]} == 0)); then
-			for i in "${!raw_statuses[@]}"; do
-				current_choices+=("$i")
-			done
+		declare -a current_choices=()
+		if ((${#valid_indices[@]} > 0)); then
+			current_choices=("${valid_indices[@]}")
+		else
+			current_choices=("${non_rejected_indices[@]}")
 		fi
 
 		choice_idx=""
@@ -631,16 +677,13 @@ if (( ${#raw_statuses[@]} > 0 && no_launch == 0 )); then
 				fi
 				printf "  [%d] Protocol: %-5s | User: %-12s | Password: %-20s (%s)\n" "$((opt_num + 1))" "$p_proto" "$display_u" "$display_p" "$p_stat"
 			done
-			if ((${#current_choices[@]} < ${#raw_statuses[@]})); then
-				printf "  [a] Show all checked services (including rejected)\n"
+			if ((${#current_choices[@]} < ${#non_rejected_indices[@]})); then
+				printf "  [a] Show all unconfirmed services\n"
 			fi
 
 			read -r -p "Enter the option number (or press Enter to cancel): " choice_idx
-			if [[ "$choice_idx" =~ ^[Aa]$ ]] && ((${#current_choices[@]} < ${#raw_statuses[@]})); then
-				current_choices=()
-				for i in "${!raw_statuses[@]}"; do
-					current_choices+=("$i")
-				done
+			if [[ "$choice_idx" =~ ^[Aa]$ ]] && ((${#current_choices[@]} < ${#non_rejected_indices[@]})); then
+				current_choices=("${non_rejected_indices[@]}")
 				continue
 			fi
 			break
@@ -837,10 +880,75 @@ if (( ${#raw_statuses[@]} > 0 && no_launch == 0 )); then
 				# Note: deliberately not using exec because mount instructions follow below.
 				if command -v showmount >/dev/null 2>&1; then
 					_ok "Fetching the NFS share list (showmount -e $target)..."
-					showmount -e "$target"
-					echo ""
-					_info "To mount a share:"
-					_info "  sudo mount -t nfs $target:/<share> /mnt"
+					nfs_out=$(showmount -e "$target" 2>&1)
+					nfs_rc=$?
+					if ((nfs_rc != 0)); then
+						_err "showmount failed (code $nfs_rc):"
+						echo "$nfs_out"
+					else
+						echo "$nfs_out"
+						echo ""
+						nfs_shares=()
+						while IFS= read -r nfs_line; do
+							[[ "$nfs_line" =~ ^Export\ list ]] && continue
+							nfs_p="$(awk '{print $1}' <<<"$nfs_line")"
+							[[ "$nfs_p" =~ ^/ ]] && nfs_shares+=("$nfs_p")
+						done <<<"$nfs_out"
+
+						if ((${#nfs_shares[@]} > 0)); then
+							_ok "Detected export(s):"
+							for s_i in "${!nfs_shares[@]}"; do
+								printf "  [%d] %s\n" "$((s_i + 1))" "${nfs_shares[$s_i]}"
+							done
+							echo ""
+							read -r -p "Enter export number to mount and explore (or press Enter to cancel): " nfs_choice
+							if [[ "$nfs_choice" =~ ^[0-9]+$ ]] && ((nfs_choice >= 1 && nfs_choice <= ${#nfs_shares[@]})); then
+								sel_share="${nfs_shares[$((nfs_choice - 1))]}"
+								echo ""
+								read -r -p "Local mount directory [/mnt]: " mount_dir
+								mount_dir="${mount_dir:-/mnt}"
+								if [[ ! -d "$mount_dir" ]]; then
+									_info "Directory '$mount_dir' does not exist. Creating with sudo..."
+									sudo mkdir -p "$mount_dir"
+								fi
+								_info "Mounting $target:$sel_share on $mount_dir..."
+								if sudo mount -t nfs -o nolock "$target:$sel_share" "$mount_dir" 2>/dev/null || sudo mount -t nfs -o nolock,vers=3 "$target:$sel_share" "$mount_dir"; then
+									_ok "Mounted successfully on $mount_dir!"
+									echo ""
+									_info "Listing contents of $mount_dir:"
+									ls -la --color=auto "$mount_dir" 2>/dev/null || ls -la "$mount_dir"
+									echo ""
+									read -r -p "Open an interactive shell in $mount_dir? [Y/n]: " shell_choice
+									if [[ ! "$shell_choice" =~ ^[Nn] ]]; then
+										_info "Entering shell in $mount_dir (type 'exit' to return)..."
+										(cd "$mount_dir" && bash -i)
+									fi
+									echo ""
+									read -r -p "Do you want to unmount $mount_dir now? [y/N]: " umount_choice
+									if [[ "$umount_choice" =~ ^[Yy] ]]; then
+										if sudo umount "$mount_dir"; then
+											_ok "Unmounted $mount_dir."
+										else
+											_err "Failed to unmount $mount_dir (files may be in use)."
+										fi
+									else
+										_info "Left mounted at $mount_dir."
+									fi
+								else
+									_err "Failed to mount $target:$sel_share on $mount_dir."
+									_info "Manual command: sudo mount -t nfs -o nolock $target:$sel_share $mount_dir"
+								fi
+							else
+								_info "Mount skipped. Manual command:"
+								for sh in "${nfs_shares[@]}"; do
+									_info "  sudo mount -t nfs -o nolock $target:$sh /mnt"
+								done
+							fi
+						else
+							_info "To mount a share:"
+							_info "  sudo mount -t nfs -o nolock $target:/SHARE_PATH /mnt"
+						fi
+					fi
 				else
 					_err "'showmount' not found in PATH."
 					_warn "Install it with: sudo apt install nfs-common"
