@@ -295,8 +295,6 @@ for proto in "${protocols[@]}"; do
 	done
 	if ((found)); then
 		active_protocols+=("$proto")
-	else
-		clog "$C_DIM" "[info]  Skipping $proto — assigned ports are not OPEN."
 	fi
 done
 ((${#active_protocols[@]})) || {
