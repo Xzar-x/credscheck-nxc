@@ -304,10 +304,10 @@ done
 protocols=("${active_protocols[@]}")
 
 # Protocols where anonymous/guest/empty make no protocol-level sense
-# (SSH/WinRM/RDP require a real account; NFS uses export ACLs and RPC UID/GID rather
+# (SSH/WinRM/RDP/WMI require a real account; NFS uses export ACLs and RPC UID/GID rather
 # than password authentication). In blind mode they only get a single availability
 # probe instead of the full list of 5 attempts.
-declare -A blind_minimal=([ssh]=1 [winrm]=1 [rdp]=1 [nfs]=1)
+declare -A blind_minimal=([ssh]=1 [winrm]=1 [rdp]=1 [nfs]=1 [wmi]=1)
 
 # Additional, commonly known default vendor/installer credentials - deliberately
 # ONLY for mssql (SQL Server auth rarely has a lockout policy). I'm intentionally
@@ -319,7 +319,7 @@ declare -A extra_defaults=([mssql]="sa:sa sa: sa:Password123 sa:admin")
 if ((user_set)); then
 	mode="Test of supplied credentials"
 else
-	mode="Test anonymous/guest/empty (SSH/WinRM/RDP/NFS: availability probe only)"
+	mode="Test anonymous/guest/empty (SSH/WinRM/RDP/NFS/WMI: availability probe only)"
 fi
 
 get_creds_for_proto() {
@@ -466,6 +466,7 @@ declare -a raw_protos=()
 declare -a raw_users=()
 declare -a raw_passes=()
 declare -a raw_statuses=()
+declare -a raw_infos=()
 
 attempt=0
 for proto in "${protocols[@]}"; do
@@ -579,7 +580,47 @@ for proto in "${protocols[@]}"; do
 			info_field="exit code $rc"
 		elif [[ "$proto" == "ftp" ]] && grep -qE '\[\+\]' <<<"$output"; then
 			status="SUCCESS"
-		elif grep -qiE '\[\+\].*(Pwn3d!|logged in|login successful|authenticated|anonymous login)' <<<"$output"; then
+		elif [[ "$proto" == "ssh" ]] && grep -qE '\[\+\]' <<<"$output"; then
+			status="SUCCESS"
+			if grep -qiE 'Pwn3d!' <<<"$output"; then
+				info_field="Pwn3d!"
+			elif grep -qiE 'Shell access' <<<"$output"; then
+				info_field="Shell access"
+			fi
+		elif [[ "$proto" == "smb" ]] && grep -qE '\[\+\]' <<<"$output"; then
+			status="SUCCESS"
+			if grep -qiE 'Pwn3d!' <<<"$output"; then
+				info_field="Pwn3d! (admin)"
+			elif grep -qiE '\(Guest\)' <<<"$output"; then
+				info_field="Guest session"
+			else
+				info_field="User (non-admin)"
+			fi
+		elif [[ "$proto" == "wmi" ]]; then
+			if grep -qiE '\(Default allow anonymous login\)' <<<"$output"; then
+				status="REJECTED"
+				info_field="epmap only, access denied"
+			elif grep -qiE 'Pwn3d!' <<<"$output"; then
+				status="SUCCESS"
+				info_field="Pwn3d! (admin)"
+			elif grep -qE '\[\+\]' <<<"$output"; then
+				status="POSSIBLE SUCCESS"
+				info_field="no admin (wmiexec denied)"
+			elif grep -qE '\[-\]' <<<"$output"; then
+				status="REJECTED"
+			fi
+		elif [[ "$proto" == "winrm" ]]; then
+			# nxc winrm always sets (Pwn3d!) after any successful WSMan enumerate,
+			# regardless of actual admin/Remote Management Users membership (nxc bug).
+			# Treat every [+] as POSSIBLE SUCCESS — creds are valid but evil-winrm
+			# requires the user to be in Remote Management Users or Administrators.
+			if grep -qE '\[\+\]' <<<"$output"; then
+				status="POSSIBLE SUCCESS"
+				info_field="valid creds (needs Remote Management Users)"
+			elif grep -qE '\[-\]' <<<"$output"; then
+				status="REJECTED"
+			fi
+		elif grep -qiE '\[\+\].*(Pwn3d!|logged in|login successful|authenticated)' <<<"$output"; then
 			status="SUCCESS"
 		elif grep -qE '\[\+\]' <<<"$output"; then
 			status="POSSIBLE SUCCESS"
@@ -627,6 +668,7 @@ for proto in "${protocols[@]}"; do
 		raw_users+=("$u")
 		raw_passes+=("$p")
 		raw_statuses+=("$status")
+		raw_infos+=("$info_field")
 
 		if ((user_set == 0)) && [[ "$status" == "SUCCESS" ]]; then
 			if ((idx + 1 < ${#proto_users[@]})); then
@@ -765,7 +807,13 @@ if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 				else
 					display_p="$(mask_pass "$p_pass")"
 				fi
-				printf "  [%d] %s Protocol: %-5s | User: %-12s | Password: %-20s (%s)\n" "$((opt_num + 1))" "$(status_symbol "$p_stat")" "$p_proto" "$display_u" "$display_p" "$p_stat"
+				p_info="${raw_infos[$idx]:-}"
+				if [[ -n "$p_info" ]]; then
+					display_stat="$p_stat - $p_info"
+				else
+					display_stat="$p_stat"
+				fi
+				printf "  [%d] %s Protocol: %-5s | User: %-12s | Password: %-20s (%s)\n" "$((opt_num + 1))" "$(status_symbol "$p_stat")" "$p_proto" "$display_u" "$display_p" "$display_stat"
 			done
 			_show_all_available=$((${#current_choices[@]} < ${#non_rejected_indices[@]}))
 			if ((_show_all_available)); then
@@ -789,6 +837,8 @@ if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 			s_proto="${raw_protos[$selected_array_idx]}"
 			s_user="${raw_users[$selected_array_idx]}"
 			s_pass="${raw_passes[$selected_array_idx]}"
+			s_stat="${raw_statuses[$selected_array_idx]}"
+			s_info="${raw_infos[$selected_array_idx]:-}"
 
 			echo ""
 			_info "Selected: protocol $s_proto for target $target (user: ${s_user:-<empty>})"
@@ -919,6 +969,10 @@ if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 				;;
 			winrm)
 				if command -v evil-winrm >/dev/null 2>&1; then
+					if [[ "$s_info" == *"Remote Management Users"* ]]; then
+						_warn "Note: evil-winrm requires the account to be in 'Remote Management Users' or 'Administrators'."
+						_warn "nxc WinRM check is unreliable — this session may fail with 'Access is denied'."
+					fi
 					_ok "Launching evil-winrm..."
 					if [[ -n "$s_pass" ]]; then
 						exec evil-winrm -i "$target" -u "$s_user" -p "$s_pass"
@@ -960,6 +1014,10 @@ if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 				fi
 
 				if [[ -n "$cmd_wmi" ]]; then
+					if [[ "$s_stat" != "SUCCESS" ]] || [[ "$s_info" == *"no admin"* ]]; then
+						_warn "Note: WMI code execution (wmiexec) requires local Administrator privileges."
+						_warn "This account is not confirmed as admin, so wmiexec will likely fail with 'rpc_s_access_denied'."
+					fi
 					_ok "Launching $cmd_wmi..."
 					if [[ -n "$s_pass" ]]; then
 						exec "$cmd_wmi" "${s_user}:${s_pass}@${target}"
