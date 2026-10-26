@@ -233,6 +233,20 @@ _warn()  { clog "$C_YELLOW" "[warn]  $*"; }
 _err()   { clog "$C_RED"    "[err]   $*"; }
 _ok()    { clog "$C_GREEN"  "[ok]    $*"; }
 
+# Startup banner — only show on an interactive terminal, never in redirected output/logs.
+show_banner() {
+	[[ -t 1 ]] || return 0
+	printf '\n%b' "$C_CYAN"
+	if command -v figlet >/dev/null 2>&1; then
+		figlet -f slant "CREDSCHECK" 2>/dev/null || figlet "CREDSCHECK"
+	else
+		printf '%b\n' "${C_BOLD}=== CREDSCHECK ===${C_RESET}${C_CYAN}"
+	fi
+	printf '%b\n' "$C_RESET"
+	printf '%b\n\n' "${C_DIM}Nmap TCP scan  |  NetExec checks${C_RESET}"
+}
+
+show_banner
 _info "Nmap is checking TCP ports: $port_list"
 _info "Target: $target"
 scan_tmp="$(mktemp)" || exit 1
