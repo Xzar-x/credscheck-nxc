@@ -579,6 +579,8 @@ for proto in "${protocols[@]}"; do
 		elif ((rc != 0)); then
 			status="NXC ERROR"
 			info_field="exit code $rc"
+		elif [[ "$proto" == "ftp" ]] && grep -qE '\[\+\]' <<<"$output"; then
+			status="SUCCESS"
 		elif grep -qiE '\[\+\].*(Pwn3d!|logged in|login successful|authenticated|anonymous login)' <<<"$output"; then
 			status="SUCCESS"
 		elif grep -qE '\[\+\]' <<<"$output"; then
