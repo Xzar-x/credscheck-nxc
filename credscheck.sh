@@ -54,6 +54,9 @@ protocols whose assigned port was found OPEN.
                     outside your own disk)
 -h, --help          show help
 
+Note: the interactive NFS client flow runs 'sudo mount'/'sudo umount' to mount
+      a discovered export — expect a sudo password prompt at that point.
+
 Examples:
   ./credscheck.sh -t 10.10.11.123
   ./credscheck.sh -t 10.10.11.123 -u admin -p 'P@ssw0rd!'
@@ -234,9 +237,7 @@ _info "Nmap is checking TCP ports: $port_list"
 _info "Target: $target"
 scan_tmp="$(mktemp)" || exit 1
 trap 'rm -f "$scan_tmp"' EXIT
-nmap -n -Pn -sT -T4 --max-retries 1 --host-timeout 15s --open -p "$port_list" -oG - "$target" >"$scan_tmp" 2>&1 &
-nmap_pid=$!
-wait "$nmap_pid"
+nmap -n -Pn -sT -T4 --max-retries 1 --host-timeout 15s --open -p "$port_list" -oG - "$target" >"$scan_tmp" 2>&1
 nmap_rc=$?
 if ((nmap_rc != 0)); then
 	printf '%b\n' "${C_RED}[err]   Nmap error (code $nmap_rc):${C_RESET}" >&2
@@ -438,7 +439,7 @@ for proto in "${protocols[@]}"; do
 		if [[ -t 1 ]]; then
 			printf '\r\033[K%b' "${C_DIM}${attempt_tag} ${proto}  ${creds_display} ...${probe_note}${C_RESET}"
 		else
-			log "${C_BOLD}${C_WHITE}${attempt_tag} $proto -- $u:$pm${probe_note}${C_RESET}"
+			log "${C_BOLD}${C_WHITE}${attempt_tag} $proto -- ${creds_display}${probe_note}${C_RESET}"
 		fi
 
 		start=$(date +%s)
@@ -483,11 +484,16 @@ for proto in "${protocols[@]}"; do
 			status="REJECTED"
 		fi
 
-		# NFS special handling: NetExec NFS doesn't authenticate user/pass, so check exports via showmount
-		if [[ "$proto" == "nfs" && "$status" == "UNKNOWN" && $rc -eq 0 ]]; then
+		# NFS special handling: NetExec NFS doesn't authenticate user/pass, and nxc nearly
+		# always emits a [+] banner line (host up / NFS version) even with empty creds and
+		# no real exports, so "status" is practically never UNKNOWN here. We therefore check
+		# exports via showmount whenever the port responded (rc=0), overriding whatever
+		# status nxc produced, rather than gating on status=="UNKNOWN".
+		if [[ "$proto" == "nfs" && $rc -eq 0 ]]; then
 			if command -v showmount >/dev/null 2>&1; then
 				_sm_check=$(timeout 5s showmount -e "$target" 2>&1)
-				if (( $? == 0 )); then
+				_sm_rc=$?
+				if ((_sm_rc == 0)); then
 					_sm_first=$(awk '$1 ~ /^\// {print $1}' <<<"$_sm_check" | head -1)
 					_sm_count=$(awk '$1 ~ /^\// {print $1}' <<<"$_sm_check" | wc -l)
 					if [[ -n "$_sm_first" ]]; then
@@ -582,7 +588,7 @@ log "${C_BOLD}${C_WHITE}${_hdr}${C_RESET}"
 _sep_len=${#_hdr}
 log "${C_DIM}$(printf '%0.s-' $(seq 1 "$_sep_len"))${C_RESET}"
 
-confirmed=0 uncertain=0 rejected_count=0
+confirmed=0 possible=0 unknown=0 rejected_count=0
 for row in "${rows[@]}"; do
 	IFS="$FS" read -r _proto _creds _status _elapsed _info <<<"$row"
 	_line="$(printf "  %-${_w_proto}s  %-${_w_creds}s  %-${_w_status}s  %4s  %s" "$_proto" "$_creds" "$_status" "$_elapsed" "$_info")"
@@ -591,10 +597,10 @@ for row in "${rows[@]}"; do
 		confirmed=$((confirmed + 1))
 	elif [[ "$_status" == "POSSIBLE SUCCESS" ]]; then
 		log "${C_YELLOW}${C_BOLD}${_line}${C_RESET}"
-		uncertain=$((uncertain + 1))
+		possible=$((possible + 1))
 	elif [[ "$_status" == "UNKNOWN" ]]; then
 		log "$_line"
-		uncertain=$((uncertain + 1))
+		unknown=$((unknown + 1))
 	elif [[ "$_status" == "REJECTED" ]]; then
 		log "${C_RED}${_line}${C_RESET}"
 		rejected_count=$((rejected_count + 1))
@@ -613,10 +619,15 @@ if ((confirmed > 0)); then
 else
 	log "${C_DIM}  ✔  confirmed: $confirmed / $_total${C_RESET}"
 fi
-if ((uncertain > 0)); then
-	log "${C_YELLOW}${C_BOLD}  ⚠  to verify: $uncertain / $_total${C_RESET}"
+if ((possible > 0)); then
+	log "${C_YELLOW}${C_BOLD}  ⚠  possible (nxc [+] hint, unverified): $possible / $_total${C_RESET}"
 else
-	log "${C_DIM}  ⚠  to verify: $uncertain / $_total${C_RESET}"
+	log "${C_DIM}  ⚠  possible (nxc [+] hint, unverified): $possible / $_total${C_RESET}"
+fi
+if ((unknown > 0)); then
+	log "${C_DIM}${C_BOLD}  ?  unknown (nxc output not classified): $unknown / $_total${C_RESET}"
+else
+	log "${C_DIM}  ?  unknown (nxc output not classified): $unknown / $_total${C_RESET}"
 fi
 if ((rejected_count > 0)); then
 	log "${C_RED}  ✗  rejected:  $rejected_count / $_total${C_RESET}"
@@ -678,7 +689,7 @@ if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 				printf "  [%d] Protocol: %-5s | User: %-12s | Password: %-20s (%s)\n" "$((opt_num + 1))" "$p_proto" "$display_u" "$display_p" "$p_stat"
 			done
 			if ((${#current_choices[@]} < ${#non_rejected_indices[@]})); then
-				printf "  [a] Show all unconfirmed services\n"
+				printf "  [a] Show all checked services (incl. UNKNOWN/unverified, excl. rejected/failed/timeout)\n"
 			fi
 
 			read -r -p "Enter the option number (or press Enter to cancel): " choice_idx
@@ -957,7 +968,7 @@ if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 			ldap)
 				# Note: deliberately not using exec because follow-up module hints follow below.
 				_ok "Querying the domain controller via NetExec LDAP (--users)..."
-				nxc ldap "$target" -u "$s_user" -p "$s_pass" --users
+				timeout "${nxc_timeout}s" nxc ldap "$target" -u "$s_user" -p "$s_pass" --users
 				echo ""
 				_info "Useful LDAP modules in nxc:"
 				_info "  nxc ldap $target -u \"$s_user\" -p \"$s_pass\" --groups"
