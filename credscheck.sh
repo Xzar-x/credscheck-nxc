@@ -387,6 +387,50 @@ literal_replace() {
 	printf '%s' "$text"
 }
 
+# Display-only symbol per status (never written into the "status" variable
+# itself - that string is matched verbatim in several places, e.g. the menu
+# and the launch-eligibility filters, so it must stay exactly "SUCCESS" etc.)
+# Gives a non-color cue too, so results stay distinguishable for red/green
+# colorblind users and in plain-text logs.
+status_symbol() {
+	case "$1" in
+	SUCCESS) printf '%s' '✔' ;;
+	"POSSIBLE SUCCESS") printf '%s' '⚠' ;;
+	REJECTED) printf '%s' '✗' ;;
+	UNKNOWN) printf '%s' '?' ;;
+	TIMEOUT | "CONNECTION FAILED" | "NXC ERROR") printf '%s' '!' ;;
+	*) printf '%s' ' ' ;;
+	esac
+}
+
+# Runs "$@" in the background, capturing its stdout+stderr to out_file and its
+# exit code to rc_file. On a real terminal it animates a spinner + a live
+# elapsed-seconds counter on the current line while waiting, using the caller's
+# attempt_tag/proto/creds_display/probe_note variables (intentionally not
+# "local" here - bash functions see the caller's scope, and that's what we
+# want: a visible, continuously updating progress indicator, instead of a
+# single static line that sits unchanged for the whole call and is easy to
+# miss, especially on non-TTY output where it wasn't shown at all before.
+run_timed() {
+	local out_file="$1" rc_file="$2"
+	shift 2
+	("$@" >"$out_file" 2>&1
+	echo $? >"$rc_file") &
+	local bg_pid=$! spin='|/-\' i=0 now el ch disp
+	if [[ -t 1 ]]; then
+		while kill -0 "$bg_pid" 2>/dev/null; do
+			now=$EPOCHREALTIME
+			el=$(awk -v s="$_t_start" -v n="$now" 'BEGIN{printf "%.0f", n-s}')
+			ch="${spin:i++%${#spin}:1}"
+			disp="$creds_display"
+			((${#disp} > 40)) && disp="${disp:0:37}..."
+			printf '\r\033[K%b' "${C_DIM}${attempt_tag} ${proto}  ${disp} ${ch} ${el}s${probe_note}${C_RESET}"
+			sleep 0.15
+		done
+	fi
+	wait "$bg_pid"
+}
+
 log "${C_CYAN}Mode:     ${C_RESET}$mode"
 log "${C_CYAN}Target:   ${C_RESET}$target"
 log "${C_CYAN}Ports:    ${C_RESET}$open_ports"
@@ -429,25 +473,43 @@ for proto in "${protocols[@]}"; do
 		probe_note=""
 		((user_set == 0)) && [[ -n "${blind_minimal[$proto]:-}" ]] && probe_note=" ${C_DIM}(availability probe)${C_RESET}"
 
-		# Print a "in progress" line that will be overwritten with the result.
-		# Only on a real terminal; in redirected/piped output fall back to a
-		# plain header line so that log files are still readable.
+		# Print a "in progress" line, then hand off to run_timed(): on a real
+		# terminal it animates a spinner + live elapsed-seconds counter on this
+		# same line for the whole duration of the call (instead of a single
+		# static line printed once and left unchanged until the call returns,
+		# which is easy to miss and looked identical to "nothing is happening").
+		# In redirected/non-TTY output there's no animation to show, so we keep
+		# the plain header line there as before.
 		creds_display="${u:-<empty>}:${pm}"
 		tag_w=${#run_count}
 		((tag_w < 2)) && tag_w=2
 		attempt_tag="$(printf '[%0*d/%0*d]' "$tag_w" "$attempt" "$tag_w" "$run_count")"
-		if [[ -t 1 ]]; then
-			printf '\r\033[K%b' "${C_DIM}${attempt_tag} ${proto}  ${creds_display} ...${probe_note}${C_RESET}"
-		else
+		if [[ ! -t 1 ]]; then
 			log "${C_BOLD}${C_WHITE}${attempt_tag} $proto -- ${creds_display}${probe_note}${C_RESET}"
 		fi
 
-		start=$(date +%s)
-		# timeout protects against hanging connections (especially HTB VPN / slow network)
-		output=$(timeout "${nxc_timeout}s" nxc "$proto" "$target" -u "$u" -p "$p" 2>&1)
-		rc=$?
-		end=$(date +%s)
-		elapsed=$((end - start))
+		_t_start=$EPOCHREALTIME
+		_out_file="$(mktemp)" && _rc_file="$(mktemp)" || exit 1
+		# NFS isn't password-authenticated (export ACLs / RPC UID-GID instead), and
+		# nxc's nfs module adds nothing showmount doesn't already tell us better -
+		# so for nfs we skip nxc entirely and call showmount directly. This saves
+		# one call and one dead table row compared to running nxc just to discard
+		# its output.
+		if [[ "$proto" == "nfs" ]]; then
+			if command -v showmount >/dev/null 2>&1; then
+				run_timed "$_out_file" "$_rc_file" timeout 5s showmount -e "$target"
+			else
+				: >"$_out_file"
+				echo 127 >"$_rc_file"
+			fi
+		else
+			# timeout protects against hanging connections (especially HTB VPN / slow network)
+			run_timed "$_out_file" "$_rc_file" timeout "${nxc_timeout}s" nxc "$proto" "$target" -u "$u" -p "$p"
+		fi
+		output="$(cat "$_out_file")"
+		rc="$(cat "$_rc_file")"
+		rm -f "$_out_file" "$_rc_file"
+		elapsed=$(awk -v s="$_t_start" -v e="$EPOCHREALTIME" 'BEGIN{printf "%.1f", e-s}')
 
 		masked="$output"
 		if ((no_mask == 0)); then
@@ -467,7 +529,34 @@ for proto in "${protocols[@]}"; do
 
 		status="UNKNOWN"
 		info_field=""
-		if ((rc == 124)); then
+		if [[ "$proto" == "nfs" ]]; then
+			if ((rc == 127)); then
+				status="NXC ERROR"
+				info_field="showmount not found in PATH"
+			elif ((rc == 124)); then
+				status="TIMEOUT"
+				info_field="exceeded 5s"
+			elif ((rc != 0)); then
+				status="CONNECTION FAILED"
+				info_field="showmount failed (code $rc)"
+			else
+				# Single pass per value instead of parsing the same showmount
+				# output twice via separate head/wc pipelines.
+				_sm_first=$(awk '$1 ~ /^\// {print $1; exit}' <<<"$output")
+				_sm_count=$(awk '$1 ~ /^\// {n++} END{print n+0}' <<<"$output")
+				if [[ -n "$_sm_first" ]]; then
+					status="SUCCESS"
+					if ((_sm_count > 1)); then
+						info_field="exports: $_sm_first (+$((_sm_count - 1)))"
+					else
+						info_field="export: $_sm_first"
+					fi
+				else
+					status="REJECTED"
+					info_field="no exports found"
+				fi
+			fi
+		elif ((rc == 124)); then
 			status="TIMEOUT"
 			info_field="exceeded ${nxc_timeout}s"
 		elif grep -qiE 'connection refused|connection error|timed? ?out|no route to host|network is unreachable|could not connect' <<<"$output"; then
@@ -484,36 +573,10 @@ for proto in "${protocols[@]}"; do
 			status="REJECTED"
 		fi
 
-		# NFS special handling: NetExec NFS doesn't authenticate user/pass, and nxc nearly
-		# always emits a [+] banner line (host up / NFS version) even with empty creds and
-		# no real exports, so "status" is practically never UNKNOWN here. We therefore check
-		# exports via showmount whenever the port responded (rc=0), overriding whatever
-		# status nxc produced, rather than gating on status=="UNKNOWN".
-		if [[ "$proto" == "nfs" && $rc -eq 0 ]]; then
-			if command -v showmount >/dev/null 2>&1; then
-				_sm_check=$(timeout 5s showmount -e "$target" 2>&1)
-				_sm_rc=$?
-				if ((_sm_rc == 0)); then
-					_sm_first=$(awk '$1 ~ /^\// {print $1}' <<<"$_sm_check" | head -1)
-					_sm_count=$(awk '$1 ~ /^\// {print $1}' <<<"$_sm_check" | wc -l)
-					if [[ -n "$_sm_first" ]]; then
-						status="SUCCESS"
-						if ((_sm_count > 1)); then
-							info_field="exports: $_sm_first (+$((_sm_count - 1)))"
-						else
-							info_field="export: $_sm_first"
-						fi
-					else
-						status="REJECTED"
-						info_field="no exports found"
-					fi
-				fi
-			fi
-		fi
-
-		# Print final one-line result (overwriting the "..." line on a terminal)
+		# Print final one-line result (overwriting the spinner line on a terminal)
 		_elapsed_s="${elapsed}s"
-		_line_plain="$(printf '%s %-7s %-22s %-20s %4s' "$attempt_tag" "$proto" "$creds_display" "$status" "$_elapsed_s")"
+		_sym="$(status_symbol "$status")"
+		_line_plain="$(printf '%s %-1s %-7s %-22s %-20s %7s' "$attempt_tag" "$_sym" "$proto" "$creds_display" "$status" "$_elapsed_s")"
 		case "$status" in
 		SUCCESS)
 			_color="$C_GREEN"
@@ -572,26 +635,32 @@ fi
 
 # -- SUMMARY ------------------------------------------------------------------
 log ""
-log "${C_BOLD}${C_CYAN}-- SUMMARY ---------------------------------------------------------------------${C_RESET}"
 
-# Compute column widths dynamically
-_w_proto=5 _w_creds=5 _w_status=6
+# Compute column widths first, so the banner line and the separator under the
+# header share one real width (previously the banner was a hardcoded 80-dash
+# line, independent of the dynamically-sized separator below the header - the
+# two could visually disagree depending on how wide the actual data was).
+_w_sym=1 _w_proto=5 _w_creds=5 _w_status=6
 for row in "${rows[@]}"; do
 	IFS="$FS" read -r _p _c _s _e _i <<<"$row"
 	(( ${#_p} > _w_proto  )) && _w_proto=${#_p}
 	(( ${#_c} > _w_creds  )) && _w_creds=${#_c}
 	(( ${#_s} > _w_status )) && _w_status=${#_s}
 done
-
-_hdr="$(printf "  %-${_w_proto}s  %-${_w_creds}s  %-${_w_status}s  %4s  %s" PROTO CREDS STATUS TIME INFO)"
-log "${C_BOLD}${C_WHITE}${_hdr}${C_RESET}"
+_hdr="$(printf "  %-${_w_sym}s %-${_w_proto}s  %-${_w_creds}s  %-${_w_status}s  %7s  %s" "" PROTO CREDS STATUS TIME INFO)"
 _sep_len=${#_hdr}
+((_sep_len < 40)) && _sep_len=40
+
+_summary_title="-- SUMMARY "
+log "${C_BOLD}${C_CYAN}${_summary_title}$(printf '%0.s-' $(seq 1 $((_sep_len - ${#_summary_title}))))${C_RESET}"
+log "${C_BOLD}${C_WHITE}${_hdr}${C_RESET}"
 log "${C_DIM}$(printf '%0.s-' $(seq 1 "$_sep_len"))${C_RESET}"
 
 confirmed=0 possible=0 unknown=0 rejected_count=0
 for row in "${rows[@]}"; do
 	IFS="$FS" read -r _proto _creds _status _elapsed _info <<<"$row"
-	_line="$(printf "  %-${_w_proto}s  %-${_w_creds}s  %-${_w_status}s  %4s  %s" "$_proto" "$_creds" "$_status" "$_elapsed" "$_info")"
+	_sym="$(status_symbol "$_status")"
+	_line="$(printf "  %-${_w_sym}s %-${_w_proto}s  %-${_w_creds}s  %-${_w_status}s  %7s  %s" "$_sym" "$_proto" "$_creds" "$_status" "$_elapsed" "$_info")"
 	if [[ "$_status" == "SUCCESS" ]]; then
 		log "${C_GREEN}${C_BOLD}${_line}${C_RESET}"
 		confirmed=$((confirmed + 1))
@@ -599,7 +668,7 @@ for row in "${rows[@]}"; do
 		log "${C_YELLOW}${C_BOLD}${_line}${C_RESET}"
 		possible=$((possible + 1))
 	elif [[ "$_status" == "UNKNOWN" ]]; then
-		log "$_line"
+		log "${C_DIM}${_line}${C_RESET}"
 		unknown=$((unknown + 1))
 	elif [[ "$_status" == "REJECTED" ]]; then
 		log "${C_RED}${_line}${C_RESET}"
@@ -624,11 +693,7 @@ if ((possible > 0)); then
 else
 	log "${C_DIM}  ⚠  possible (nxc [+] hint, unverified): $possible / $_total${C_RESET}"
 fi
-if ((unknown > 0)); then
-	log "${C_DIM}${C_BOLD}  ?  unknown (nxc output not classified): $unknown / $_total${C_RESET}"
-else
-	log "${C_DIM}  ?  unknown (nxc output not classified): $unknown / $_total${C_RESET}"
-fi
+log "${C_DIM}  ?  unknown (nxc output not classified): $unknown / $_total${C_RESET}"
 if ((rejected_count > 0)); then
 	log "${C_RED}  ✗  rejected:  $rejected_count / $_total${C_RESET}"
 else
@@ -686,13 +751,18 @@ if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 				else
 					display_p="$(mask_pass "$p_pass")"
 				fi
-				printf "  [%d] Protocol: %-5s | User: %-12s | Password: %-20s (%s)\n" "$((opt_num + 1))" "$p_proto" "$display_u" "$display_p" "$p_stat"
+				printf "  [%d] %s Protocol: %-5s | User: %-12s | Password: %-20s (%s)\n" "$((opt_num + 1))" "$(status_symbol "$p_stat")" "$p_proto" "$display_u" "$display_p" "$p_stat"
 			done
-			if ((${#current_choices[@]} < ${#non_rejected_indices[@]})); then
-				printf "  [a] Show all checked services (incl. UNKNOWN/unverified, excl. rejected/failed/timeout)\n"
+			_show_all_available=$((${#current_choices[@]} < ${#non_rejected_indices[@]}))
+			if ((_show_all_available)); then
+				printf "  [a] Show all checked services (incl. UNKNOWN/NXC ERROR, excl. rejected/failed/timeout)\n"
 			fi
 
-			read -r -p "Enter the option number (or press Enter to cancel): " choice_idx
+			if ((_show_all_available)); then
+				read -r -p "Enter option number, [a] for all, or Enter to cancel: " choice_idx
+			else
+				read -r -p "Enter the option number (or press Enter to cancel): " choice_idx
+			fi
 			if [[ "$choice_idx" =~ ^[Aa]$ ]] && ((${#current_choices[@]} < ${#non_rejected_indices[@]})); then
 				current_choices=("${non_rejected_indices[@]}")
 				continue
