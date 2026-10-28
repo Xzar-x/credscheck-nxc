@@ -852,7 +852,7 @@ if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 					# Removed /dynamic-resolution and +clipboard – on virtual machines (e.g. HTB)
 					# dynamic scaling of the DVC (disp) channel causes a graphics driver error
 					# on Windows and an immediate user session sign-out ("Signing out").
-					rdp_args=(/v:"$target" /cert:tofu /f)
+					rdp_args=(/v:"$target" /cert:ignore /f)
 					if [[ "$s_user" == *"\\"* ]]; then
 						rdp_args+=(/d:"${s_user%%\\*}" /u:"${s_user#*\\}")
 					elif [[ -n "$s_user" ]]; then
