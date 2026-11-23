@@ -8,12 +8,18 @@ Nmap.
 
 1. Runs a quick Nmap TCP scan limited to the ports of the protocols you
    asked for, so nxc is never called against a closed port.
-2. For each open protocol, runs `nxc` with either the credentials you
-   supplied, or a blind-test set (`anonymous`/`guest`/empty), with a
-   couple of sane adjustments:
-   - **SSH / WinRM / RDP** don't have a concept of an "anonymous" login, so
-     in blind mode they only get a single availability probe instead of a
-     full guessing list.
+2. Splits open protocols into two execution phases and runs checks with either
+   the credentials you supplied, or a blind-test set
+   (`anonymous`/`guest`/empty):
+   - **Phase 1 — Independent services (parallel per protocol):** `nfs`, `ftp`,
+     `vnc`, `ssh` run concurrently (up to 4 workers, one per protocol) with
+     per-protocol SQLite isolation and deterministic output collection.
+   - **Phase 2 — Windows/AD protocols (sequential):** `smb`, `ldap`, `winrm`,
+     `rdp`, `wmi`, `mssql` run sequentially with delays and early
+     `STATUS_ACCOUNT_LOCKED_OUT` detection to avoid locking out AD accounts.
+   - **SSH / WinRM / RDP / NFS / WMI** don't have a concept of an "anonymous"
+     login, so in blind mode they only get a single availability probe instead
+     of a full guessing list.
    - **MSSQL** additionally gets common SQL-auth defaults (`sa:sa`,
      `sa:<empty>`, `sa:Password123`, `sa:admin`) - SQL Server auth rarely has
      an account-lockout policy, unlike Active Directory.
@@ -38,6 +44,9 @@ Nmap.
   uploading it anywhere outside your own disk.
 - Deliberately skips guessing default creds on SMB/WinRM/RDP, since those
   usually sit behind Active Directory account-lockout policies.
+- **Account lockout detection (`STATUS_ACCOUNT_LOCKED_OUT`)** - Windows/AD
+  protocols run sequentially in Phase 2; if a lockout response is detected
+  for a user, remaining Phase 2 attempts for that user are skipped immediately.
 
 ## Supported protocols
 

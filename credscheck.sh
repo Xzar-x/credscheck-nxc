@@ -172,6 +172,8 @@ awk -v a="$delay_min" -v b="$delay_max" 'BEGIN{exit !(a<=b)}' || {
 
 if [[ -n "$protocols_arg" ]]; then
 	IFS=',' read -r -a protocols <<<"$protocols_arg"
+	declare -a _uniq_protocols=()
+	declare -A _seen_protocols=()
 	for i in "${!protocols[@]}"; do
 		protocols[$i]="${protocols[$i]//[[:space:]]/}"
 		protocols[$i]="${protocols[$i],,}"
@@ -179,7 +181,12 @@ if [[ -n "$protocols_arg" ]]; then
 			echo "Error: empty protocol name." >&2
 			exit 1
 		}
+		if [[ -z "${_seen_protocols[${protocols[$i]}]:-}" ]]; then
+			_seen_protocols["${protocols[$i]}"]=1
+			_uniq_protocols+=("${protocols[$i]}")
+		fi
 	done
+	protocols=("${_uniq_protocols[@]}")
 else
 	protocols=(smb ssh ftp winrm mssql rdp ldap wmi nfs vnc)
 fi
@@ -246,11 +253,47 @@ show_banner() {
 	printf '%b\n\n' "${C_DIM}Nmap TCP scan  |  NetExec checks${C_RESET}"
 }
 
+declare -A parallel_protos=([nfs]=1 [ftp]=1 [vnc]=1 [ssh]=1)
+declare -A locked_users=()          # key: "${u:-__EMPTY__}", value: 1
+declare -a phase1_protos=()
+declare -a phase2_protos=()
+declare -A proto_budget=()          # max calls allocated per protocol
+declare -a p1_pids=()
+declare -a p1_worker_protos=()
+MAX_PARALLEL=4
+work_dir=""                         # created via mktemp -d before Phase 1
+scan_tmp=""
+_cleanup_done=0
+_phase2_bg_pid=""
+
+cleanup() {
+	local exit_code=$?
+	((_cleanup_done)) && return "$exit_code"
+	_cleanup_done=1
+	trap - EXIT INT TERM
+	if [[ -n "${_phase2_bg_pid:-}" ]]; then
+		pkill -TERM -P "$_phase2_bg_pid" 2>/dev/null || true
+		kill "$_phase2_bg_pid" 2>/dev/null || true
+		wait "$_phase2_bg_pid" 2>/dev/null || true
+	fi
+	if ((${#p1_pids[@]} > 0)); then
+		local _pid
+		for _pid in "${p1_pids[@]}"; do
+			pkill -TERM -P "$_pid" 2>/dev/null || true
+		done
+		kill "${p1_pids[@]}" 2>/dev/null || true
+		wait "${p1_pids[@]}" 2>/dev/null || true
+	fi
+	[[ -n "${scan_tmp:-}" ]] && rm -f "$scan_tmp"
+	[[ -n "${work_dir:-}" ]] && rm -rf "$work_dir"
+	exit "$exit_code"
+}
+
 show_banner
 _info "Nmap is checking TCP ports: $port_list"
 _info "Target: $target"
 scan_tmp="$(mktemp)" || exit 1
-trap 'rm -f "$scan_tmp"' EXIT
+trap cleanup EXIT INT TERM
 nmap -n -Pn -sT -T4 --max-retries 1 --host-timeout 15s --open -p "$port_list" -oG - "$target" >"$scan_tmp" 2>&1
 nmap_rc=$?
 if ((nmap_rc != 0)); then
@@ -429,6 +472,7 @@ run_timed() {
 	("$@" >"$out_file" 2>&1
 	echo $? >"$rc_file") &
 	local bg_pid=$! spin='|/-\' i=0 now el ch disp
+	_phase2_bg_pid="$bg_pid"
 	if [[ -t 1 ]]; then
 		while kill -0 "$bg_pid" 2>/dev/null; do
 			now=$EPOCHREALTIME
@@ -441,6 +485,321 @@ run_timed() {
 		done
 	fi
 	wait "$bg_pid"
+	local _rt_rc=$?
+	_phase2_bg_pid=""
+	return "$_rt_rc"
+}
+
+is_parallel_proto() {
+	[[ -n "${parallel_protos[$1]:-}" ]]
+}
+
+mask_output() {
+	local output="$1"
+	local cur_pass="$2"
+	shift 2
+	local masked="$output"
+	if ((no_mask == 0)); then
+		local -a mask_targets=()
+		local secret already seen
+		for secret in "$cur_pass" "$@"; do
+			[[ -z "$secret" ]] && continue
+			already=0
+			if ((${#mask_targets[@]} > 0)); then
+				for seen in "${mask_targets[@]}"; do
+					[[ "$seen" == "$secret" ]] && {
+						already=1
+						break
+					}
+				done
+			fi
+			((already)) || mask_targets+=("$secret")
+		done
+		if ((${#mask_targets[@]} > 0)); then
+			sort_by_length_desc mask_targets
+			for secret in "${mask_targets[@]}"; do
+				masked="$(literal_replace "$masked" "$secret" "$(mask_pass "$secret")")"
+			done
+		fi
+	fi
+	printf '%s' "$masked"
+}
+
+classify_result() {
+	local proto="$1"
+	local rc="$2"
+	local output="$3"
+
+	_res_status="UNKNOWN"
+	_res_info=""
+	_res_lockout=0
+
+	if [[ "$proto" != "nfs" ]] && grep -qiE 'STATUS_ACCOUNT_LOCKED_OUT' <<<"$output"; then
+		_res_lockout=1
+	fi
+
+	# NFS isn't password-authenticated (export ACLs / RPC UID-GID instead), and
+	# nxc's nfs module adds nothing showmount doesn't already tell us better -
+	# so for nfs we skip nxc entirely and call showmount directly.
+	if [[ "$proto" == "nfs" ]]; then
+		if ((rc == 127)); then
+			_res_status="NXC ERROR"
+			_res_info="showmount not found in PATH"
+		elif ((rc == 124)); then
+			_res_status="TIMEOUT"
+			_res_info="exceeded 5s"
+		elif ((rc != 0)); then
+			_res_status="CONNECTION FAILED"
+			_res_info="showmount failed (code $rc)"
+		else
+			# Single pass per value instead of parsing the same showmount
+			# output twice via separate head/wc pipelines.
+			local _sm_first _sm_count
+			_sm_first=$(awk '$1 ~ /^\// {print $1; exit}' <<<"$output")
+			_sm_count=$(awk '$1 ~ /^\// {n++} END{print n+0}' <<<"$output")
+			if [[ -n "$_sm_first" ]]; then
+				_res_status="SUCCESS"
+				if ((_sm_count > 1)); then
+					_res_info="exports: $_sm_first (+$((_sm_count - 1)))"
+				else
+					_res_info="export: $_sm_first"
+				fi
+			else
+				_res_status="REJECTED"
+				_res_info="no exports found"
+			fi
+		fi
+	elif ((rc == 124)); then
+		_res_status="TIMEOUT"
+		_res_info="exceeded ${nxc_timeout}s"
+	elif ((_res_lockout == 1)); then
+		_res_status="REJECTED"
+		_res_info="ACCOUNT LOCKED OUT (STATUS_ACCOUNT_LOCKED_OUT)"
+	elif grep -qiE 'connection refused|connection error|timed? ?out|no route to host|network is unreachable|could not connect' <<<"$output"; then
+		_res_status="CONNECTION FAILED"
+		_res_info="$(grep -oiE 'connection refused|connection error|timed? ?out|no route to host|network is unreachable|could not connect' <<<"$output" | head -1)"
+	elif ((rc != 0)); then
+		_res_status="NXC ERROR"
+		_res_info="exit code $rc"
+	elif [[ "$proto" == "ftp" ]] && grep -qE '\[\+\]' <<<"$output"; then
+		_res_status="SUCCESS"
+	elif [[ "$proto" == "ssh" ]] && grep -qE '\[\+\]' <<<"$output"; then
+		_res_status="SUCCESS"
+		if grep -qiE 'Pwn3d!' <<<"$output"; then
+			_res_info="Pwn3d!"
+		elif grep -qiE 'Shell access' <<<"$output"; then
+			_res_info="Shell access"
+		fi
+	elif [[ "$proto" == "smb" ]] && grep -qE '\[\+\]' <<<"$output"; then
+		_res_status="SUCCESS"
+		if grep -qiE 'Pwn3d!' <<<"$output"; then
+			_res_info="Pwn3d! (admin)"
+		elif grep -qiE '\(Guest\)' <<<"$output"; then
+			_res_info="Guest session"
+		else
+			_res_info="User (non-admin)"
+		fi
+	elif [[ "$proto" == "wmi" ]]; then
+		if grep -qiE '\(Default allow anonymous login\)' <<<"$output"; then
+			_res_status="REJECTED"
+			_res_info="epmap only, access denied"
+		elif grep -qiE 'Pwn3d!' <<<"$output"; then
+			_res_status="SUCCESS"
+			_res_info="Pwn3d! (admin)"
+		elif grep -qE '\[\+\]' <<<"$output"; then
+			_res_status="POSSIBLE SUCCESS"
+			_res_info="no admin (wmiexec denied)"
+		elif grep -qE '\[-\]' <<<"$output"; then
+			_res_status="REJECTED"
+		fi
+	elif [[ "$proto" == "winrm" ]]; then
+		# nxc winrm always sets (Pwn3d!) after any successful WSMan enumerate,
+		# regardless of actual admin/Remote Management Users membership (nxc bug).
+		# Treat every [+] as POSSIBLE SUCCESS — creds are valid but evil-winrm
+		# requires the user to be in Remote Management Users or Administrators.
+		if grep -qE '\[\+\]' <<<"$output"; then
+			_res_status="POSSIBLE SUCCESS"
+			_res_info="valid creds (needs Remote Management Users)"
+		elif grep -qE '\[-\]' <<<"$output"; then
+			_res_status="REJECTED"
+		fi
+	elif grep -qiE '\[\+\].*(Pwn3d!|logged in|login successful|authenticated)' <<<"$output"; then
+		_res_status="SUCCESS"
+	elif grep -qE '\[\+\]' <<<"$output"; then
+		_res_status="POSSIBLE SUCCESS"
+	elif grep -qE '\[-\]' <<<"$output"; then
+		_res_status="REJECTED"
+	fi
+}
+
+execute_probe() {
+	local proto="$1"
+	local u="$2"
+	local p="$3"
+	local out_file="$4"
+	local rc_file="$5"
+	local use_spinner="${6:-0}"
+	local -a cmd=()
+
+	if [[ "$proto" == "nfs" ]]; then
+		if command -v showmount >/dev/null 2>&1; then
+			cmd=(timeout 5s showmount -e "$target")
+		else
+			: >"$out_file"
+			echo 127 >"$rc_file"
+			return 0
+		fi
+	else
+		# timeout protects against hanging connections (especially HTB VPN / slow network)
+		cmd=(timeout "${nxc_timeout}s" nxc "$proto" "$target" -u "$u" -p "$p")
+	fi
+
+	if ((use_spinner)); then
+		run_timed "$out_file" "$rc_file" "${cmd[@]}"
+	else
+		"${cmd[@]}" >"$out_file" 2>&1 &
+		_worker_child_pid=$!
+		wait "$_worker_child_pid" 2>/dev/null
+		echo $? >"$rc_file"
+		_worker_child_pid=""
+	fi
+}
+
+print_result_line() {
+	local attempt_tag="$1"
+	local proto="$2"
+	local creds_display="$3"
+	local status="$4"
+	local elapsed_s="$5"
+	local _sym _line_plain _color
+
+	_sym="$(status_symbol "$status")"
+	_line_plain="$(printf '%s %-1s %-7s %-22s %-20s %7s' "$attempt_tag" "$_sym" "$proto" "$creds_display" "$status" "$elapsed_s")"
+	case "$status" in
+	SUCCESS)
+		_color="$C_GREEN"
+		;;
+	"POSSIBLE SUCCESS")
+		_color="$C_YELLOW"
+		;;
+	REJECTED)
+		_color="$C_RED"
+		;;
+	TIMEOUT | "CONNECTION FAILED" | "NXC ERROR")
+		_color="$C_YELLOW"
+		;;
+	*)
+		_color=""
+		;;
+	esac
+	if [[ -t 1 ]]; then
+		printf '\r\033[K%b\n' "${_color}${_line_plain}${C_RESET}"
+		[[ -n "$output_file" ]] && printf '%s\n' "$_line_plain" >>"$output_file"
+	else
+		log "${_color}${_line_plain}${C_RESET}"
+	fi
+}
+
+run_parallel_worker() {
+	local proto="$1"
+	local worker_dir="$2"
+	local max_calls="$3"
+	local _worker_child_pid=""
+
+	_worker_cleanup() {
+		trap - INT TERM EXIT
+		if [[ -n "${_worker_child_pid:-}" ]]; then
+			pkill -TERM -P "$_worker_child_pid" 2>/dev/null || true
+			kill "$_worker_child_pid" 2>/dev/null || true
+			wait "$_worker_child_pid" 2>/dev/null || true
+		fi
+	}
+	trap - EXIT
+	trap '_worker_cleanup; exit 143' INT TERM
+
+	get_creds_for_proto "$proto"
+	local total_creds=${#proto_users[@]}
+	local limit=$total_creds
+	((max_calls < limit)) && limit=$max_calls
+
+	local idx u p pm creds_display tmp_out tmp_rc _t_start rc output elapsed masked
+	local meta_file log_file delay skipped_for_proto
+	local _res_status _res_info _res_lockout
+
+	for ((idx = 0; idx < limit; idx++)); do
+		u="${proto_users[$idx]}"
+		p="${proto_passwords[$idx]}"
+		# BUG FIX: use explicit [[ -z ]] instead of :- so that a literal
+		# "(empty)" password is not confused with an actual empty string.
+		if ((no_mask)); then
+			[[ -z "$p" ]] && pm="(empty)" || pm="$p"
+		else
+			pm="$(mask_pass "$p")"
+		fi
+		creds_display="${u:-<empty>}:${pm}"
+
+		tmp_out="$worker_dir/.tmp_out"
+		tmp_rc="$worker_dir/.tmp_rc"
+		_t_start=$EPOCHREALTIME
+		execute_probe "$proto" "$u" "$p" "$tmp_out" "$tmp_rc" 0
+		output="$(cat "$tmp_out" 2>/dev/null || true)"
+		rc="$(cat "$tmp_rc" 2>/dev/null || echo 1)"
+		rm -f "$tmp_out" "$tmp_rc"
+		elapsed=$(awk -v s="$_t_start" -v e="$EPOCHREALTIME" 'BEGIN{printf "%.1f", e-s}')
+
+		classify_result "$proto" "$rc" "$output"
+		masked="$(mask_output "$output" "$p" "${proto_passwords[@]}")"
+
+		meta_file="$worker_dir/$(printf '%03d' "$idx").meta"
+		log_file="$worker_dir/$(printf '%03d' "$idx").log"
+		printf '%s%s%s%s%s%s%s%s%s\n' "$idx" "$FS" "$_res_status" "$FS" "$elapsed" "$FS" "$_res_info" "$FS" "$creds_display" >"$meta_file"
+		printf '%s' "$masked" >"$log_file"
+
+		if ((user_set == 0)) && [[ "$_res_status" == "SUCCESS" ]]; then
+			if ((idx + 1 < total_creds)); then
+				skipped_for_proto=$((total_creds - idx - 1))
+				printf '%s\n' "$skipped_for_proto" >"$worker_dir/skipped"
+			fi
+			break
+		fi
+
+		if ((idx + 1 < limit)); then
+			delay=$(awk -v r="$((RANDOM + BASHPID + idx))" -v min="$delay_min" -v max="$delay_max" 'BEGIN{srand(r); printf "%.2f", min+rand()*(max-min)}')
+			sleep "$delay" &
+			_worker_child_pid=$!
+			wait "$_worker_child_pid" 2>/dev/null || true
+			_worker_child_pid=""
+		fi
+	done
+}
+
+wait_phase1_with_spinner() {
+	local wroot="$1"
+	shift
+	((${#p1_pids[@]} > 0)) || return 0
+	local spin='|/-\' i=0 t_start=$EPOCHREALTIME now el ch active_list idx pid p
+	if [[ -t 1 ]]; then
+		while true; do
+			active_list=""
+			for idx in "${!p1_pids[@]}"; do
+				pid="${p1_pids[$idx]}"
+				p="${p1_worker_protos[$idx]}"
+				if [[ ! -f "$wroot/p1_${p}/.done" ]] && kill -0 "$pid" 2>/dev/null; then
+					active_list+="${active_list:+ }$p"
+				fi
+			done
+			[[ -z "$active_list" ]] && break
+			now=$EPOCHREALTIME
+			el=$(awk -v s="$t_start" -v n="$now" 'BEGIN{printf "%.0f", n-s}')
+			ch="${spin:i++%${#spin}:1}"
+			printf '\r\033[K%b' "${C_DIM}[phase 1] parallel: ${active_list} ${ch} ${el}s${C_RESET}"
+			sleep 0.15
+		done
+		printf '\r\033[K'
+	fi
+	wait "${p1_pids[@]}" 2>/dev/null || true
+	p1_pids=()
+	p1_worker_protos=()
 }
 
 log "${C_CYAN}Mode:     ${C_RESET}$mode"
@@ -468,13 +827,121 @@ declare -a raw_passes=()
 declare -a raw_statuses=()
 declare -a raw_infos=()
 
-attempt=0
 for proto in "${protocols[@]}"; do
+	if is_parallel_proto "$proto"; then
+		phase1_protos+=("$proto")
+	else
+		phase2_protos+=("$proto")
+	fi
+done
+
+_remaining_budget=$run_count
+for proto in "${phase1_protos[@]}"; do
+	get_creds_for_proto "$proto"
+	_need=${#proto_users[@]}
+	if ((_remaining_budget <= 0)); then
+		proto_budget["$proto"]=0
+	elif ((_need <= _remaining_budget)); then
+		proto_budget["$proto"]=$_need
+		_remaining_budget=$((_remaining_budget - _need))
+	else
+		proto_budget["$proto"]=$_remaining_budget
+		_remaining_budget=0
+	fi
+done
+for proto in "${phase2_protos[@]}"; do
+	get_creds_for_proto "$proto"
+	_need=${#proto_users[@]}
+	if ((_remaining_budget <= 0)); then
+		proto_budget["$proto"]=0
+	elif ((_need <= _remaining_budget)); then
+		proto_budget["$proto"]=$_need
+		_remaining_budget=$((_remaining_budget - _need))
+	else
+		proto_budget["$proto"]=$_remaining_budget
+		_remaining_budget=0
+	fi
+done
+
+work_dir="$(mktemp -d)" || exit 1
+tag_w=${#run_count}
+((tag_w < 2)) && tag_w=2
+attempt=0
+skipped_lockout=0
+
+# -- Phase 1: Independent services (parallel per protocol) --------------------
+if ((${#phase1_protos[@]} > 0)); then
+	for proto in "${phase1_protos[@]}"; do
+		_p_budget=${proto_budget[$proto]:-0}
+		((_p_budget > 0)) || continue
+		((${#p1_pids[@]} < MAX_PARALLEL)) || wait_phase1_with_spinner "$work_dir" "${p1_worker_protos[@]}"
+		_wdir="$work_dir/p1_${proto}"
+		mkdir -p "$_wdir"
+		(
+			run_parallel_worker "$proto" "$_wdir" "$_p_budget"
+			: >"$_wdir/.done"
+		) &
+		p1_pids+=($!)
+		p1_worker_protos+=("$proto")
+	done
+
+	if ((${#p1_pids[@]} > 0)); then
+		if [[ ! -t 1 ]]; then
+			log "${C_DIM}[phase 1] parallel workers: ${p1_worker_protos[*]}${C_RESET}"
+		fi
+		wait_phase1_with_spinner "$work_dir" "${p1_worker_protos[@]}"
+	fi
+
+	for proto in "${phase1_protos[@]}"; do
+		_wdir="$work_dir/p1_${proto}"
+		[[ -d "$_wdir" ]] || continue
+		get_creds_for_proto "$proto"
+		for _meta_file in "$_wdir"/[0-9]*.meta; do
+			[[ -f "$_meta_file" ]] || continue
+			IFS="$FS" read -r _w_idx _w_status _w_elapsed _w_info _w_creds <"$_meta_file"
+			attempt=$((attempt + 1))
+			attempt_tag="$(printf '[%0*d/%0*d]' "$tag_w" "$attempt" "$tag_w" "$run_count")"
+			_elapsed_s="${_w_elapsed}s"
+			print_result_line "$attempt_tag" "$proto" "$_w_creds" "$_w_status" "$_elapsed_s"
+
+			if [[ -n "$output_file" ]]; then
+				_log_file="${_meta_file%.meta}.log"
+				_masked_log="$(cat "$_log_file" 2>/dev/null || true)"
+				printf '%s\n\n' "$(strip_ansi "$_masked_log")" >>"$output_file"
+			fi
+
+			u="${proto_users[$_w_idx]}"
+			p="${proto_passwords[$_w_idx]}"
+			rows+=("${proto}${FS}${_w_creds}${FS}${_w_status}${FS}${_elapsed_s}${FS}${_w_info}")
+			raw_protos+=("$proto")
+			raw_users+=("$u")
+			raw_passes+=("$p")
+			raw_statuses+=("$_w_status")
+			raw_infos+=("$_w_info")
+		done
+		if [[ -f "$_wdir/skipped" ]]; then
+			_skipped_for_proto="$(cat "$_wdir/skipped" 2>/dev/null || echo 0)"
+			if ((_skipped_for_proto > 0)); then
+				_ok "Confirmed success for $proto — skipping $_skipped_for_proto remaining blind check(s)."
+			fi
+		fi
+	done
+fi
+
+# -- Phase 2: Windows / AD protocols (sequential with lockout detection) ------
+for proto in "${phase2_protos[@]}"; do
+	((attempt < run_count)) || break
 	get_creds_for_proto "$proto"
 	for idx in "${!proto_users[@]}"; do
 		((attempt < run_count)) || break
 		u="${proto_users[$idx]}"
 		p="${proto_passwords[$idx]}"
+		_u_key="${u:-__EMPTY__}"
+		if [[ -n "${locked_users[$_u_key]:-}" ]]; then
+			skipped_lockout=$((skipped_lockout + 1))
+			continue
+		fi
+
 		# BUG FIX: use explicit [[ -z ]] instead of :- so that a literal
 		# "(empty)" password is not confused with an actual empty string.
 		if ((no_mask)); then
@@ -486,175 +953,33 @@ for proto in "${protocols[@]}"; do
 		probe_note=""
 		((user_set == 0)) && [[ -n "${blind_minimal[$proto]:-}" ]] && probe_note=" ${C_DIM}(availability probe)${C_RESET}"
 
-		# Print a "in progress" line, then hand off to run_timed(): on a real
-		# terminal it animates a spinner + live elapsed-seconds counter on this
-		# same line for the whole duration of the call (instead of a single
-		# static line printed once and left unchanged until the call returns,
-		# which is easy to miss and looked identical to "nothing is happening").
-		# In redirected/non-TTY output there's no animation to show, so we keep
-		# the plain header line there as before.
 		creds_display="${u:-<empty>}:${pm}"
-		tag_w=${#run_count}
-		((tag_w < 2)) && tag_w=2
 		attempt_tag="$(printf '[%0*d/%0*d]' "$tag_w" "$attempt" "$tag_w" "$run_count")"
 		if [[ ! -t 1 ]]; then
 			log "${C_BOLD}${C_WHITE}${attempt_tag} $proto -- ${creds_display}${probe_note}${C_RESET}"
 		fi
 
 		_t_start=$EPOCHREALTIME
-		_out_file="$(mktemp)" && _rc_file="$(mktemp)" || exit 1
-		# NFS isn't password-authenticated (export ACLs / RPC UID-GID instead), and
-		# nxc's nfs module adds nothing showmount doesn't already tell us better -
-		# so for nfs we skip nxc entirely and call showmount directly. This saves
-		# one call and one dead table row compared to running nxc just to discard
-		# its output.
-		if [[ "$proto" == "nfs" ]]; then
-			if command -v showmount >/dev/null 2>&1; then
-				run_timed "$_out_file" "$_rc_file" timeout 5s showmount -e "$target"
-			else
-				: >"$_out_file"
-				echo 127 >"$_rc_file"
-			fi
-		else
-			# timeout protects against hanging connections (especially HTB VPN / slow network)
-			run_timed "$_out_file" "$_rc_file" timeout "${nxc_timeout}s" nxc "$proto" "$target" -u "$u" -p "$p"
-		fi
-		output="$(cat "$_out_file")"
-		rc="$(cat "$_rc_file")"
+		_out_file="$work_dir/p2.out"
+		_rc_file="$work_dir/p2.rc"
+		execute_probe "$proto" "$u" "$p" "$_out_file" "$_rc_file" 1
+		output="$(cat "$_out_file" 2>/dev/null || true)"
+		rc="$(cat "$_rc_file" 2>/dev/null || echo 1)"
 		rm -f "$_out_file" "$_rc_file"
 		elapsed=$(awk -v s="$_t_start" -v e="$EPOCHREALTIME" 'BEGIN{printf "%.1f", e-s}')
 
-		masked="$output"
-		if ((no_mask == 0)); then
-			mask_targets=()
-			for secret in "$p" "${proto_passwords[@]}"; do
-				[[ -z "$secret" ]] && continue
-				already=0
-				for seen in "${mask_targets[@]:-}"; do [[ "$seen" == "$secret" ]] && {
-					already=1
-					break
-				}; done
-				((already)) || mask_targets+=("$secret")
-			done
-			sort_by_length_desc mask_targets
-			for secret in "${mask_targets[@]}"; do masked="$(literal_replace "$masked" "$secret" "$(mask_pass "$secret")")"; done
-		fi
+		_res_status="UNKNOWN"
+		_res_info=""
+		_res_lockout=0
+		classify_result "$proto" "$rc" "$output"
+		status="$_res_status"
+		info_field="$_res_info"
 
-		status="UNKNOWN"
-		info_field=""
-		if [[ "$proto" == "nfs" ]]; then
-			if ((rc == 127)); then
-				status="NXC ERROR"
-				info_field="showmount not found in PATH"
-			elif ((rc == 124)); then
-				status="TIMEOUT"
-				info_field="exceeded 5s"
-			elif ((rc != 0)); then
-				status="CONNECTION FAILED"
-				info_field="showmount failed (code $rc)"
-			else
-				# Single pass per value instead of parsing the same showmount
-				# output twice via separate head/wc pipelines.
-				_sm_first=$(awk '$1 ~ /^\// {print $1; exit}' <<<"$output")
-				_sm_count=$(awk '$1 ~ /^\// {n++} END{print n+0}' <<<"$output")
-				if [[ -n "$_sm_first" ]]; then
-					status="SUCCESS"
-					if ((_sm_count > 1)); then
-						info_field="exports: $_sm_first (+$((_sm_count - 1)))"
-					else
-						info_field="export: $_sm_first"
-					fi
-				else
-					status="REJECTED"
-					info_field="no exports found"
-				fi
-			fi
-		elif ((rc == 124)); then
-			status="TIMEOUT"
-			info_field="exceeded ${nxc_timeout}s"
-		elif grep -qiE 'connection refused|connection error|timed? ?out|no route to host|network is unreachable|could not connect' <<<"$output"; then
-			status="CONNECTION FAILED"
-			info_field="$(grep -oiE 'connection refused|connection error|timed? ?out|no route to host|network is unreachable|could not connect' <<<"$output" | head -1)"
-		elif ((rc != 0)); then
-			status="NXC ERROR"
-			info_field="exit code $rc"
-		elif [[ "$proto" == "ftp" ]] && grep -qE '\[\+\]' <<<"$output"; then
-			status="SUCCESS"
-		elif [[ "$proto" == "ssh" ]] && grep -qE '\[\+\]' <<<"$output"; then
-			status="SUCCESS"
-			if grep -qiE 'Pwn3d!' <<<"$output"; then
-				info_field="Pwn3d!"
-			elif grep -qiE 'Shell access' <<<"$output"; then
-				info_field="Shell access"
-			fi
-		elif [[ "$proto" == "smb" ]] && grep -qE '\[\+\]' <<<"$output"; then
-			status="SUCCESS"
-			if grep -qiE 'Pwn3d!' <<<"$output"; then
-				info_field="Pwn3d! (admin)"
-			elif grep -qiE '\(Guest\)' <<<"$output"; then
-				info_field="Guest session"
-			else
-				info_field="User (non-admin)"
-			fi
-		elif [[ "$proto" == "wmi" ]]; then
-			if grep -qiE '\(Default allow anonymous login\)' <<<"$output"; then
-				status="REJECTED"
-				info_field="epmap only, access denied"
-			elif grep -qiE 'Pwn3d!' <<<"$output"; then
-				status="SUCCESS"
-				info_field="Pwn3d! (admin)"
-			elif grep -qE '\[\+\]' <<<"$output"; then
-				status="POSSIBLE SUCCESS"
-				info_field="no admin (wmiexec denied)"
-			elif grep -qE '\[-\]' <<<"$output"; then
-				status="REJECTED"
-			fi
-		elif [[ "$proto" == "winrm" ]]; then
-			# nxc winrm always sets (Pwn3d!) after any successful WSMan enumerate,
-			# regardless of actual admin/Remote Management Users membership (nxc bug).
-			# Treat every [+] as POSSIBLE SUCCESS — creds are valid but evil-winrm
-			# requires the user to be in Remote Management Users or Administrators.
-			if grep -qE '\[\+\]' <<<"$output"; then
-				status="POSSIBLE SUCCESS"
-				info_field="valid creds (needs Remote Management Users)"
-			elif grep -qE '\[-\]' <<<"$output"; then
-				status="REJECTED"
-			fi
-		elif grep -qiE '\[\+\].*(Pwn3d!|logged in|login successful|authenticated)' <<<"$output"; then
-			status="SUCCESS"
-		elif grep -qE '\[\+\]' <<<"$output"; then
-			status="POSSIBLE SUCCESS"
-		elif grep -qE '\[-\]' <<<"$output"; then
-			status="REJECTED"
-		fi
+		masked="$(mask_output "$output" "$p" "${proto_passwords[@]}")"
 
 		# Print final one-line result (overwriting the spinner line on a terminal)
 		_elapsed_s="${elapsed}s"
-		_sym="$(status_symbol "$status")"
-		_line_plain="$(printf '%s %-1s %-7s %-22s %-20s %7s' "$attempt_tag" "$_sym" "$proto" "$creds_display" "$status" "$_elapsed_s")"
-		case "$status" in
-		SUCCESS)
-			_color="$C_GREEN"
-			;;
-		"POSSIBLE SUCCESS")
-			_color="$C_YELLOW"
-			;;
-		REJECTED)
-			_color="$C_RED"
-			;;
-		TIMEOUT | "CONNECTION FAILED" | "NXC ERROR")
-			_color="$C_YELLOW"
-			;;
-		*)
-			_color=""
-			;;
-		esac
-		if [[ -t 1 ]]; then
-			printf '\r\033[K%b\n' "${_color}${_line_plain}${C_RESET}"
-			[[ -n "$output_file" ]] && printf '%s\n' "$_line_plain" >>"$output_file"
-		else
-			log "${_color}${_line_plain}${C_RESET}"
-		fi
+		print_result_line "$attempt_tag" "$proto" "$creds_display" "$status" "$_elapsed_s"
 
 		# Verbose nxc output goes to log file only; on terminal it is suppressed
 		# to keep output clean. To see raw nxc output redirect with -o.
@@ -669,6 +994,11 @@ for proto in "${protocols[@]}"; do
 		raw_passes+=("$p")
 		raw_statuses+=("$status")
 		raw_infos+=("$info_field")
+
+		if ((_res_lockout == 1)); then
+			locked_users["$_u_key"]=1
+			_warn "Account lockout detected (STATUS_ACCOUNT_LOCKED_OUT) for user '${u:-<empty>}' — skipping remaining Phase 2 attempts for this user."
+		fi
 
 		if ((user_set == 0)) && [[ "$status" == "SUCCESS" ]]; then
 			if ((idx + 1 < ${#proto_users[@]})); then
@@ -685,8 +1015,13 @@ for proto in "${protocols[@]}"; do
 	done
 	((attempt >= run_count)) && break
 done
+
 if ((planned > attempt)); then
-	log "${C_DIM}Finished in $attempt call(s); skipped $((planned - attempt)) combinations (success detected or limit).${C_RESET}"
+	if ((skipped_lockout > 0)); then
+		log "${C_DIM}Finished in $attempt call(s); skipped $((planned - attempt)) combinations (success detected, limit, or lockout).${C_RESET}"
+	else
+		log "${C_DIM}Finished in $attempt call(s); skipped $((planned - attempt)) combinations (success detected or limit).${C_RESET}"
+	fi
 fi
 
 # -- SUMMARY ------------------------------------------------------------------
@@ -769,6 +1104,9 @@ for i in "${!raw_statuses[@]}"; do
 		non_rejected_indices+=("$i")
 	fi
 done
+
+[[ -n "${scan_tmp:-}" ]] && rm -f "$scan_tmp" && scan_tmp=""
+[[ -n "${work_dir:-}" ]] && rm -rf "$work_dir" && work_dir=""
 
 if (( ${#non_rejected_indices[@]} > 0 && no_launch == 0 )); then
 	launch_choice="n"

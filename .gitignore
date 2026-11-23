@@ -17,3 +17,7 @@ scan_*
 .DS_Store
 *.swp
 *~
+
+# Robocze pliki planowania i ciężkie artefakty
+plans/current-spec.md
+plans/artifacts/
